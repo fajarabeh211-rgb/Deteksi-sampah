@@ -1,0 +1,10 @@
+venv/
+.venv/
+runs/
+dataset/
+__pycache__/
+*.pyc
+*.ipynb
+.git/
+.vscode/
+README.md
