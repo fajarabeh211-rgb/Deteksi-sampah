@@ -25,7 +25,7 @@ from ultralytics import YOLO
 
 # ----------------------------- Konfigurasi -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = os.getenv("MODEL_PATH", str(BASE_DIR / "model" / "best.onnx"))
+MODEL_PATH = os.getenv("MODEL_PATH", str(BASE_DIR / "models" / "best.onnx"))
 DEFAULT_CONF = float(os.getenv("CONF_THRESHOLD", "0.347"))  # puncak kurva F1 hasil training
 IMG_SIZE = int(os.getenv("IMG_SIZE", "640"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
