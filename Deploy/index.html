@@ -435,6 +435,39 @@ function showMsg(t, err){const m=$("msg"); m.className = t ? "msg"+(err?" err":"
 const fmtConf = v => String(Number(v).toFixed(3)).replace(/0+$/,"").replace(/\.$/,"");
 const kb = n => (n/1024).toFixed(1) + " KB";
 
+// Jika server mengembalikan halaman error HTML (502, restart, kehabisan memori), tampilkan pesan yang jelas.
+async function readJson(r){
+  try{ return await r.json(); }
+  catch{ throw new Error(`Server mengembalikan halaman error (kode ${r.status}). Server mungkin sedang restart atau kehabisan memori, coba lagi sebentar.`); }
+}
+
+// Perkecil gambar di browser sebelum dikirim: upload lebih cepat dan memori server lebih hemat.
+// Gambar juga disimpan ulang sebagai JPEG sehingga arah foto (EXIF) sudah benar.
+const MAX_SIDE = 1280;
+async function prepareImage(file){
+  let bmp;
+  try{ bmp = await createImageBitmap(file); }catch{ return {blob:file, ow:0, oh:0}; }
+  const ow = bmp.width, oh = bmp.height, sc = Math.min(1, MAX_SIDE / Math.max(ow, oh));
+  const w = Math.max(1, Math.round(ow*sc)), h = Math.max(1, Math.round(oh*sc));
+  const c = document.createElement("canvas"); c.width = w; c.height = h;
+  const x = c.getContext("2d"); x.fillStyle = "#fff"; x.fillRect(0, 0, w, h); x.drawImage(bmp, 0, 0, w, h);
+  bmp.close();
+  const blob = await new Promise(r => c.toBlob(r, "image/jpeg", 0.9));
+  return {blob: blob || file, ow, oh};
+}
+// Koordinat dari server mengikuti gambar yang dikirim; kembalikan ke ukuran gambar asli untuk digambar.
+function toOriginalCoords(data, ow, oh){
+  if(!ow || !oh || !data.image || !data.image.width) return;
+  const sx = ow / data.image.width, sy = oh / data.image.height;
+  if(Math.abs(sx-1) < 1e-6 && Math.abs(sy-1) < 1e-6) return;
+  data.detections.forEach(d => {
+    const b = d.bbox;
+    b.x1 = +(b.x1*sx).toFixed(1); b.x2 = +(b.x2*sx).toFixed(1);
+    b.y1 = +(b.y1*sy).toFixed(1); b.y2 = +(b.y2*sy).toFixed(1);
+  });
+  data.image = {width: ow, height: oh};
+}
+
 /* ---------------- Tema ---------------- */
 function applyTheme(t){
   document.documentElement.dataset.theme = t;
@@ -555,10 +588,12 @@ $("nextBtn").addEventListener("click", () => { if(sel < items.length-1){ sel++; 
 async function detectItem(it){
   it.status = "processing"; it.err = ""; renderAll();
   try{
-    const fd = new FormData(); fd.append("file", it.file);
+    const prep = await prepareImage(it.file);
+    const fd = new FormData(); fd.append("file", prep.blob, "image.jpg");
     const r = await fetch(`${API}/v1/predict?conf=${$("conf").value}`, {method:"POST", body:fd});
-    const data = await r.json();
+    const data = await readJson(r);
     if(!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Permintaan tidak valid.");
+    toOriginalCoords(data, prep.ow, prep.oh);
     it.data = data; it.status = "done";
     if(!it.counted){ it.counted = true; addSession(data.detections); }
   }catch(e){
@@ -753,6 +788,7 @@ function smooth(dets){
   });
 }
 
+const CAM_W = 480;     // lebar frame kamera yang dikirim ke server (px); makin kecil makin cepat
 const STILL_MS = 1500;  // objek harus diam selama ini (ms) sebelum gambar ditangkap
 let prev = null, stillSince = 0, captured = false;
 
@@ -834,14 +870,14 @@ async function loop(){
   while(running){
     const t0 = performance.now();
     if(vid.videoWidth){
-      const sc = Math.min(1, 640 / vid.videoWidth);
+      const sc = Math.min(1, CAM_W / vid.videoWidth);
       grab.width = Math.round(vid.videoWidth*sc); grab.height = Math.round(vid.videoHeight*sc);
       grab.getContext("2d").drawImage(vid, 0, 0, grab.width, grab.height);
-      const blob = await new Promise(r => grab.toBlob(r, "image/jpeg", 0.92));
+      const blob = await new Promise(r => grab.toBlob(r, "image/jpeg", 0.7));
       try{
         const fd = new FormData(); fd.append("file", blob, "frame.jpg");
         const r = await fetch(`${API}/v1/predict?conf=${$("conf").value}`, {method:"POST", body:fd});
-        const data = await r.json();
+        const data = await readJson(r);
         if(!running) return;
         if(!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Permintaan tidak valid.");
         const sm = smooth(data.detections);

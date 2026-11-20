@@ -1,38 +1,47 @@
 """
-API Deteksi Jenis Sampah (YOLO11) - versi deployment.
+API Deteksi Jenis Sampah (YOLO11 via ONNX Runtime)
 
-Satu server melayani frontend (/) dan API (/health, /v1/predict, /v1/stats).
-Konfigurasi lewat environment variable, lihat bagian Konfigurasi.
+Versi ringan untuk hosting gratis (RAM 512 MB): tanpa PyTorch dan Ultralytics.
+Endpoint dan format respons sama dengan versi sebelumnya, jadi index.html tidak perlu diubah.
+
+Jalankan lokal:
+    uvicorn main:app --reload
+Dokumentasi interaktif:
+    http://127.0.0.1:8000/docs
 """
+import ast
+import ctypes
 import io
-import json
-import logging
 import os
-import re
 import threading
 import time
-import uuid
-from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+import numpy as np
+import onnxruntime as ort
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
-from ultralytics import YOLO
 
 # ----------------------------- Konfigurasi -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = os.getenv("MODEL_PATH", str(BASE_DIR / "models" / "best.onnx"))
-DEFAULT_CONF = float(os.getenv("CONF_THRESHOLD", "0.347"))  # puncak kurva F1 hasil training
-IMG_SIZE = int(os.getenv("IMG_SIZE", "640"))
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+DEFAULT_CONF = float(os.getenv("CONF_THRESHOLD", "0.347"))  # ambang terbaik dari kurva F1
+IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.5"))
+MAX_DET = 300
+MAX_UPLOAD_MB = 10
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1600"))                 # sisi terpanjang gambar yang diproses (px)
+MAX_PIXELS = int(os.getenv("MAX_PIXELS", str(40_000_000)))    # tolak gambar dengan resolusi ekstrem
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "1"))        # jumlah gambar diproses bersamaan
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
-VERSION = "1.1.0"
 
+# Dipakai hanya jika file ONNX tidak menyimpan nama kelas. Urutan HARUS sama dengan data.yaml.
+FALLBACK_NAMES = ["organik", "anorganik", "residu", "B3"]
+
+# Saran penanganan per jenis sampah (nama kelas sesuai data.yaml)
 TIPS = {
     "organik": "Sampah organik: dapat dikomposkan. Buang ke tempat sampah organik (hijau).",
     "anorganik": "Sampah anorganik: dapat didaur ulang. Bersihkan lalu buang ke tempat sampah anorganik (kuning).",
@@ -40,193 +49,243 @@ TIPS = {
     "B3": "Sampah B3 (bahan berbahaya dan beracun): jangan dicampur sampah biasa. Serahkan ke tempat pengumpulan khusus.",
 }
 
-# ----------------------------- Logging & statistik -----------------------------
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-log = logging.getLogger("api")
+# ----------------------------- Hemat memori -----------------------------
+# Hanya MAX_CONCURRENT gambar yang diproses sekaligus, sisanya mengantre. Tanpa ini, beberapa
+# request bersamaan (mis. kamera + upload) menumpuk memori dan bisa mematikan kontainer 512 MB.
+_gate = threading.BoundedSemaphore(MAX_CONCURRENT)
+
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    _libc = None
 
 
-def percentile(values, q):
-    if not values:
-        return None
-    s = sorted(values)
-    return round(s[min(len(s) - 1, round(q / 100 * (len(s) - 1)))], 1)
+def trim_memory():
+    """Minta glibc mengembalikan memori bekas ke sistem (Python jarang melakukannya sendiri)."""
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
 
 
-class Stats:
-    """Statistik di memori (hilang saat restart; gunakan satu worker)."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.started = time.time()
-        self.requests = 0
-        self.errors = 0
-        self.detections = 0
-        self.inference = deque(maxlen=500)  # inference_ms 500 request terakhir
-
-    def count_request(self, status_code: int):
-        with self.lock:
-            self.requests += 1
-            if status_code >= 400:
-                self.errors += 1
-
-    def add_inference(self, ms: float, n_det: int):
-        with self.lock:
-            self.inference.append(ms)
-            self.detections += n_det
-
-    def snapshot(self):
-        with self.lock:
-            inf = list(self.inference)
-            return {
-                "uptime_s": round(time.time() - self.started),
-                "requests": self.requests,
-                "errors": self.errors,
-                "error_rate": round(self.errors / self.requests, 4) if self.requests else 0.0,
-                "detections_total": self.detections,
-                "inference_ms": {
-                    "samples": len(inf),
-                    "avg": round(sum(inf) / len(inf), 1) if inf else None,
-                    "p50": percentile(inf, 50),
-                    "p95": percentile(inf, 95),
-                    "p99": percentile(inf, 99),
-                },
-            }
+def rss_mb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except OSError:
+        pass
+    return None
 
 
-stats = Stats()
-infer_lock = threading.Lock()  # satu inferensi pada satu waktu: aman dan tidak berebut CPU
-model: Optional[YOLO] = None
+# ----------------------------- Model -----------------------------
+session: Optional[ort.InferenceSession] = None
+input_name = ""
+in_h, in_w = 640, 640
+in_fp16 = False
+names: dict = {}
 
 
-# ----------------------------- Aplikasi -----------------------------
+def load_names(sess: ort.InferenceSession) -> dict:
+    """Ultralytics menyimpan nama kelas di metadata ONNX, misalnya "{0: 'organik', ...}"."""
+    raw = sess.get_modelmeta().custom_metadata_map.get("names")
+    if raw:
+        try:
+            parsed = ast.literal_eval(raw)
+            if isinstance(parsed, dict):
+                return {int(k): str(v) for k, v in parsed.items()}
+        except (ValueError, SyntaxError):
+            pass
+    return {i: n for i, n in enumerate(FALLBACK_NAMES)}
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_: FastAPI):
     """Model dimuat sekali saat server menyala, bukan di setiap request."""
-    global model
-    if not Path(MODEL_PATH).exists():
+    global session, input_name, in_h, in_w, in_fp16, names
+    if not os.path.exists(MODEL_PATH):
         raise RuntimeError(f"File model tidak ditemukan: {MODEL_PATH}")
-    model = YOLO(MODEL_PATH)
-    model.predict(Image.new("RGB", (IMG_SIZE, IMG_SIZE)), imgsz=IMG_SIZE, iou=0.5, agnostic_nms=True, verbose=False)  # warm-up
-    log.info(json.dumps({"event": "startup", "model": os.path.basename(MODEL_PATH), "version": VERSION}))
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = int(os.getenv("ORT_THREADS", "1"))  # hemat memori/CPU di paket gratis
+    opts.inter_op_num_threads = 1
+    opts.enable_cpu_mem_arena = False   # cegah memori membengkak setelah banyak request
+    opts.enable_mem_pattern = False
+    session = ort.InferenceSession(MODEL_PATH, sess_options=opts, providers=["CPUExecutionProvider"])
+    inp = session.get_inputs()[0]
+    input_name = inp.name
+    h, w = inp.shape[2], inp.shape[3]
+    in_h = h if isinstance(h, int) else 640
+    in_w = w if isinstance(w, int) else 640
+    in_fp16 = "float16" in inp.type
+    names = load_names(session)
+    # warm-up supaya request pertama tidak lambat
+    session.run(None, {input_name: np.zeros((1, 3, in_h, in_w), dtype=np.float16 if in_fp16 else np.float32)})
     yield
 
 
+# ----------------------------- Aplikasi -----------------------------
 app = FastAPI(
     title="API Deteksi Jenis Sampah",
-    description="Deteksi sampah organik, anorganik, residu, dan B3 menggunakan YOLO11.",
-    version=VERSION,
+    description="Deteksi sampah organik, anorganik, residu, dan B3 menggunakan YOLO11 (ONNX Runtime).",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
+    allow_origins=["*"],  # untuk produksi, ganti dengan domain frontend-mu
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
 )
-
-
-@app.middleware("http")
-async def observe(request: Request, call_next):
-    """Beri setiap request sebuah ID, ukur durasinya, dan catat satu baris log JSON."""
-    rid = re.sub(r"[^A-Za-z0-9_.-]", "", request.headers.get("x-request-id", ""))[:64] or uuid.uuid4().hex[:12]
-    request.state.request_id = rid
-    start = time.perf_counter()
-    try:
-        response = await call_next(request)
-    except Exception:
-        log.exception(json.dumps({"event": "unhandled_error", "request_id": rid, "path": request.url.path}))
-        response = JSONResponse({"detail": "Terjadi kesalahan pada server."}, status_code=500)
-    duration_ms = round((time.perf_counter() - start) * 1000, 1)
-    response.headers["X-Request-ID"] = rid
-    if request.url.path == "/v1/predict":
-        stats.count_request(response.status_code)
-    log.info(json.dumps({
-        "event": "request", "request_id": rid, "method": request.method,
-        "path": request.url.path, "status": response.status_code, "duration_ms": duration_ms,
-    }))
-    return response
 
 
 @app.get("/", include_in_schema=False)
 def index():
-    page = BASE_DIR / "index.html"
-    if page.exists():
-        return FileResponse(page)
-    return {"message": "API Deteksi Jenis Sampah aktif. Dokumentasi: /docs"}
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    return Response(status_code=204)
+    return FileResponse(BASE_DIR / "index.html")
 
 
 @app.get("/health")
 def health():
     return {
-        "status": "ok" if model is not None else "model_not_loaded",
-        "version": VERSION,
+        "status": "ok" if session is not None else "model_not_loaded",
         "model": os.path.basename(MODEL_PATH),
-        "classes": list(model.names.values()) if model else [],
+        "classes": list(names.values()),
         "default_conf": DEFAULT_CONF,
-        "uptime_s": stats.snapshot()["uptime_s"],
+        "memory_mb": rss_mb(),
     }
 
 
-@app.get("/v1/stats")
-def get_stats():
-    """Ringkasan monitoring: jumlah request, error rate, dan latensi inferensi (p50/p95/p99)."""
-    return stats.snapshot()
+# ----------------------------- Praproses & pascaproses -----------------------------
+def load_image(data: bytes) -> Image.Image:
+    """Buka gambar dengan hemat memori: JPEG didekode langsung dalam ukuran kecil."""
+    img = Image.open(io.BytesIO(data))
+    w, h = img.size
+    if w * h > MAX_PIXELS:
+        raise ValueError(f"Resolusi gambar terlalu besar (maks {MAX_PIXELS // 1_000_000} megapiksel).")
+    if img.format == "JPEG":
+        img.draft("RGB", (MAX_SIDE, MAX_SIDE))
+    img = img.convert("RGB")
+    if max(img.size) > MAX_SIDE:
+        img.thumbnail((MAX_SIDE, MAX_SIDE), Image.BILINEAR)
+    return img
 
 
+def preprocess(image: Image.Image):
+    """Letterbox ke ukuran input model (padding abu-abu 114), RGB, 0-1, NCHW."""
+    w0, h0 = image.size
+    r = min(in_h / h0, in_w / w0)
+    nw, nh = max(1, round(w0 * r)), max(1, round(h0 * r))
+    resized = image.resize((nw, nh), Image.BILINEAR)
+    canvas = Image.new("RGB", (in_w, in_h), (114, 114, 114))
+    px, py = (in_w - nw) // 2, (in_h - nh) // 2
+    canvas.paste(resized, (px, py))
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
+    arr = np.ascontiguousarray(arr.transpose(2, 0, 1)[None])
+    return (arr.astype(np.float16) if in_fp16 else arr), r, px, py
+
+
+def nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float):
+    """NMS lintas kelas (setara agnostic_nms=True)."""
+    order = scores.argsort()[::-1]
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    keep = []
+    while order.size:
+        i = order[0]
+        keep.append(int(i))
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
+        yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
+        yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+        inter = np.clip(xx2 - xx1, 0, None) * np.clip(yy2 - yy1, 0, None)
+        iou = inter / (areas[i] + areas[rest] - inter + 1e-9)
+        order = rest[iou <= iou_thr]
+    return keep
+
+
+def postprocess(out: np.ndarray, conf_thr: float, r: float, px: int, py: int, w0: int, h0: int):
+    pred = np.asarray(out[0], dtype=np.float32)  # (4+nc, N) untuk YOLO11
+    if pred.shape[0] < pred.shape[1]:
+        pred = pred.T                           # -> (N, 4+nc)
+    scores_all = pred[:, 4:]
+    cls = scores_all.argmax(axis=1)
+    conf = scores_all.max(axis=1)
+    m = conf >= conf_thr
+    if not m.any():
+        return []
+    pred, cls, conf = pred[m], cls[m], conf[m]
+    if len(conf) > MAX_DET * 4:                 # batasi kandidat sebelum NMS
+        top = conf.argsort()[::-1][: MAX_DET * 4]
+        pred, cls, conf = pred[top], cls[top], conf[top]
+
+    cx, cy, w, h = pred[:, 0], pred[:, 1], pred[:, 2], pred[:, 3]
+    boxes = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=1)
+    boxes[:, [0, 2]] = (boxes[:, [0, 2]] - px) / r   # kembalikan ke koordinat gambar asli
+    boxes[:, [1, 3]] = (boxes[:, [1, 3]] - py) / r
+    boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, w0)
+    boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, h0)
+
+    keep = nms(boxes, conf, IOU_THRESHOLD)[:MAX_DET]
+    return [(int(cls[i]), float(conf[i]), boxes[i]) for i in keep]
+
+
+# ----------------------------- Endpoint prediksi -----------------------------
 @app.post("/v1/predict")
 def predict(
-    request: Request,
     file: UploadFile = File(..., description="Gambar sampah (JPG/PNG/WEBP, maks 10 MB)"),
     conf: float = Query(DEFAULT_CONF, ge=0.05, le=0.95, description="Ambang confidence"),
 ):
-    if model is None:
+    if session is None:
         raise HTTPException(status_code=503, detail="Model belum siap.")
+
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(status_code=415, detail="Format tidak didukung. Gunakan JPG, PNG, atau WEBP.")
 
-    data = file.file.read(MAX_UPLOAD_MB * 1024 * 1024 + 1)
+    data = file.file.read()
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"Ukuran file melebihi {MAX_UPLOAD_MB} MB.")
 
-    try:
-        image = Image.open(io.BytesIO(data)).convert("RGB")
-    except (UnidentifiedImageError, OSError):
-        raise HTTPException(status_code=400, detail="File bukan gambar yang valid.")
+    with _gate:
+        try:
+            image = load_image(data)
+        except ValueError as e:
+            raise HTTPException(status_code=413, detail=str(e))
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError):
+            raise HTTPException(status_code=400, detail="File bukan gambar yang valid.")
+        finally:
+            del data
 
-    start = time.perf_counter()
-    try:
-        with infer_lock:
-            result = model.predict(image, conf=conf, imgsz=IMG_SIZE, iou=0.5, agnostic_nms=True, verbose=False)[0]
-    except Exception:
-        log.exception(json.dumps({"event": "inference_error", "request_id": request.state.request_id}))
-        raise HTTPException(status_code=500, detail="Gagal memproses gambar.")
-    inference_ms = (time.perf_counter() - start) * 1000
+        start = time.perf_counter()
+        tensor, r, px, py = preprocess(image)
+        out = session.run(None, {input_name: tensor})[0]
+        found = postprocess(out, conf, r, px, py, image.width, image.height)
+        inference_ms = (time.perf_counter() - start) * 1000
+        img_w, img_h = image.width, image.height
+        del tensor, out, image
+        trim_memory()
 
     detections = []
-    for box in result.boxes:
-        label = result.names[int(box.cls)]
-        x1, y1, x2, y2 = [round(float(v), 1) for v in box.xyxy[0].tolist()]
-        detections.append({
-            "label": label,
-            "confidence": round(float(box.conf), 4),
-            "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-            "tip": TIPS.get(label, ""),
-        })
+    for c, score, b in found:
+        label = names.get(c, str(c))
+        x1, y1, x2, y2 = [round(float(v), 1) for v in b]
+        detections.append(
+            {
+                "label": label,
+                "confidence": round(score, 4),
+                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                "tip": TIPS.get(label, ""),
+            }
+        )
     detections.sort(key=lambda d: d["confidence"], reverse=True)
-    stats.add_inference(inference_ms, len(detections))
 
     return {
-        "request_id": request.state.request_id,
         "count": len(detections),
         "detections": detections,
-        "image": {"width": image.width, "height": image.height},
+        "image": {"width": img_w, "height": img_h},
         "conf_threshold": conf,
         "inference_ms": round(inference_ms, 1),
         "message": "OK" if detections else "Tidak ada sampah terdeteksi pada ambang confidence ini.",
