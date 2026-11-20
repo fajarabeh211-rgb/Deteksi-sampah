@@ -30,4 +30,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:%s/health'%os.environ.get('PORT','7860'))"
 
 # Satu worker: model dimuat sekali dan statistik /v1/stats tetap konsisten
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860} --workers 1
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-1024} --workers 1
