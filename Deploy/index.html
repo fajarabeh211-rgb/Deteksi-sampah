@@ -598,7 +598,7 @@ async function detectItem(it){
     if(!it.counted){ it.counted = true; addSession(data.detections); }
   }catch(e){
     it.status = "error";
-    it.err = e instanceof TypeError ? "Tidak dapat terhubung ke server. Pastikan uvicorn sedang berjalan." : e.message;
+    it.err = e instanceof TypeError ? "Server tidak terjangkau. Jika baru dibangunkan dari mode tidur, tunggu sekitar satu menit lalu coba lagi." : e.message;
   }
   renderAll();
 }
@@ -876,7 +876,7 @@ async function loop(){
       const blob = await new Promise(r => grab.toBlob(r, "image/jpeg", 0.7));
       try{
         const fd = new FormData(); fd.append("file", blob, "frame.jpg");
-        const r = await fetch(`${API}/v1/predict?conf=${$("conf").value}`, {method:"POST", body:fd});
+        const r = await fetch(`${API}/v1/predict?conf=${$("conf").value}&fast=1`, {method:"POST", body:fd});
         const data = await readJson(r);
         if(!running) return;
         if(!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Permintaan tidak valid.");
@@ -886,7 +886,7 @@ async function loop(){
         $("camStat").textContent = `${(1000/(performance.now()-t0)).toFixed(1)} FPS · inferensi ${data.inference_ms} ms`;
         checkStill(sm);
       }catch(e){
-        showMsg(e instanceof TypeError ? "Terputus dari server. Pastikan uvicorn sedang berjalan." : e.message, true);
+        showMsg(e instanceof TypeError ? "Server tidak terjangkau. Jika baru dibangunkan dari mode tidur, tunggu sekitar satu menit lalu coba lagi." : e.message, true);
         stopUi("Kamera dihentikan karena terjadi kesalahan."); return;
       }
     }
